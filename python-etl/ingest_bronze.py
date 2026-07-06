@@ -91,6 +91,19 @@ def download_from_source(url: str) -> bytes:
 
     return data
 
+def validate_download(data: bytes, min_size_mb: float = 10.0) -> None:
+    """
+    Basic sanity check on downloaded data.
+    Raises ValueError if file is suspiciously small.
+    """
+    size_mb = len(data) / (1024 * 1024)
+    if size_mb < min_size_mb:
+        raise ValueError(
+            f"Downloaded file too small: {size_mb:.2f}MB. "
+            f"Expected at least {min_size_mb}MB. "
+            f"Possible corrupt download."
+        )
+    logger.info(f"Validation passed: {size_mb:.2f}MB — looks healthy")
 
 def upload_to_bronze(
     blob_client: BlobServiceClient,
@@ -129,7 +142,10 @@ def run_ingestion() -> None:
         # Step 2: Download from source
         raw_data = download_from_source(SOURCE_URL)
 
-        # Step 3: Upload to bronze layer
+        # Step 3: Validate download
+        validate_download(raw_data)
+
+        # Step 4: Upload to bronze layer
         upload_to_bronze(blob_client, raw_data, BRONZE_PATH)
 
         # Success summary
