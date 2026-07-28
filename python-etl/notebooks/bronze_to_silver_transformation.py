@@ -229,3 +229,192 @@ spark.sql(f"""
 
 # COMMAND ----------
 
+# Cell 7 — Read silver layer + create dimension DataFrames
+# Starting point for gold layer / fact table creation
+
+from pyspark.sql.functions import broadcast, col, year, month, hour
+
+# ── Read silver layer (already cleaned + written on Day 8) ──
+df_silver = spark.read.format("delta").load(SILVER)
+print(f"✅ Silver data loaded: {df_silver.count():,} rows")
+
+# ── Create dimension DataFrames ──────────────────────────────
+# These are small lookup tables — perfect for broadcast joins
+
+# dim_vendor (2 rows)
+dim_vendor = spark.createDataFrame([
+    (1, "Creative Mobile Technologies"),
+    (2, "VeriFone Inc"),
+], ["vendor_id", "vendor_name"])
+
+# dim_payment_type (6 rows)
+dim_payment = spark.createDataFrame([
+    (1, "Credit Card"),
+    (2, "Cash"),
+    (3, "No Charge"),
+    (4, "Dispute"),
+    (5, "Unknown"),
+    (6, "Voided Trip"),
+], ["payment_type", "payment_name"])
+
+# dim_rate (6 rows)
+dim_rate = spark.createDataFrame([
+    (1, "Standard Rate"),
+    (2, "JFK"),
+    (3, "Newark"),
+    (4, "Nassau/Westchester"),
+    (5, "Negotiated Fare"),
+    (6, "Group Ride"),
+], ["rate_code_id", "rate_name"])
+
+print("✅ Dimension DataFrames created!")
+print(f"   dim_vendor:  {dim_vendor.count()} rows")
+print(f"   dim_payment: {dim_payment.count()} rows")
+print(f"   dim_rate:    {dim_rate.count()} rows")
+
+# COMMAND ----------
+
+# Cell 8 — Build fact_taxi_trips (Gold Layer)
+# Join silver data with dimension tables
+
+from pyspark.sql.functions import broadcast, col, monotonically_increasing_id
+
+print("Building fact_taxi_trips...")
+
+# ── Join silver with dimensions using broadcast ──────────────
+fact_taxi_trips = df_silver \
+    .join(broadcast(dim_vendor), on="vendor_id", how="left") \
+    .join(broadcast(dim_payment), on="payment_type", how="left") \
+    .join(broadcast(dim_rate), on="rate_code_id", how="left") \
+    .select(
+        # Surrogate key
+        monotonically_increasing_id().alias("trip_surrogate_key"),
+
+        # Foreign keys to dimensions
+        col("vendor_id"),
+        col("vendor_name"),
+        col("pickup_location_id"),
+        col("dropoff_location_id"),
+        col("rate_code_id"),
+        col("rate_name"),
+        col("payment_type"),
+        col("payment_name"),
+
+        # Date/time
+        col("pickup_datetime"),
+        col("dropoff_datetime"),
+        col("pickup_date"),
+        col("pickup_year"),
+        col("pickup_month"),
+        col("trip_duration_mins"),
+
+        # Measures (facts)
+        col("passenger_count"),
+        col("trip_distance"),
+        col("fare_amount"),
+        col("tip_amount"),
+        col("tolls_amount"),
+        col("total_amount"),
+        col("congestion_surcharge"),
+        col("airport_fee"),
+    )
+
+# ── Summary ───────────────────────────────────────────────────
+fact_count = fact_taxi_trips.count()
+print(f"✅ fact_taxi_trips built!")
+print(f"   Rows: {fact_count:,}")
+print(f"   Columns: {len(fact_taxi_trips.columns)}")
+print(f"\nSample:")
+fact_taxi_trips.select(
+    "vendor_name", "payment_name", "rate_name",
+    "trip_distance", "fare_amount", "total_amount",
+    "trip_duration_mins"
+).show(5, truncate=True)
+
+# COMMAND ----------
+
+# Cell 9 — Write fact_taxi_trips to gold layer
+
+GOLD = f"{BASE}/gold/star_schema/fact_taxi_trips/"
+
+print("Writing fact_taxi_trips to gold layer...")
+
+fact_taxi_trips.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .partitionBy("pickup_year", "pickup_month") \
+    .save(GOLD)
+
+print("✅ Gold layer written successfully!")
+print(f"Location: {GOLD}")
+
+# Verify
+df_gold = spark.read.format("delta").load(GOLD)
+print(f"Verification — rows in gold: {df_gold.count():,}")
+print(f"\nPartitions:")
+spark.sql(f"""
+    SELECT pickup_year, pickup_month, COUNT(*) as rows
+    FROM delta.`{GOLD}`
+    GROUP BY 1, 2
+""").show()
+
+# COMMAND ----------
+
+# Cell 10 — Business analysis on gold layer
+# This is what Power BI will query
+
+print("📊 GOLD LAYER ANALYSIS — NYC Taxi January 2024")
+print("=" * 55)
+
+# Revenue by vendor
+print("\n💰 Revenue by vendor:")
+spark.sql(f"""
+    SELECT vendor_name,
+           COUNT(*)                     AS total_trips,
+           ROUND(SUM(fare_amount), 2)   AS total_revenue,
+           ROUND(AVG(fare_amount), 2)   AS avg_fare,
+           ROUND(AVG(trip_distance), 2) AS avg_distance,
+           ROUND(AVG(trip_duration_mins), 2) AS avg_duration_mins
+    FROM delta.`{GOLD}`
+    GROUP BY vendor_name
+    ORDER BY total_revenue DESC
+""").show()
+
+# Payment method breakdown
+print("\n💳 Payment method breakdown:")
+spark.sql(f"""
+    SELECT payment_name,
+           COUNT(*) AS trips,
+           ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 1) AS pct
+    FROM delta.`{GOLD}`
+    GROUP BY payment_name
+    ORDER BY trips DESC
+""").show()
+
+# Hourly trip pattern
+print("\n🕐 Revenue by hour of day:")
+spark.sql(f"""
+    SELECT HOUR(pickup_datetime) AS hour,
+           COUNT(*) AS trips,
+           ROUND(SUM(fare_amount), 2) AS revenue,
+           ROUND(AVG(fare_amount), 2) AS avg_fare
+    FROM delta.`{GOLD}`
+    GROUP BY 1
+    ORDER BY revenue DESC
+    LIMIT 10
+""").show()
+
+# Top pickup locations
+print("\n📍 Top 10 pickup locations:")
+spark.sql(f"""
+    SELECT pickup_location_id,
+           COUNT(*) AS trips,
+           ROUND(SUM(fare_amount), 2) AS revenue
+    FROM delta.`{GOLD}`
+    GROUP BY pickup_location_id
+    ORDER BY trips DESC
+    LIMIT 10
+""").show()
+
+# COMMAND ----------
+
